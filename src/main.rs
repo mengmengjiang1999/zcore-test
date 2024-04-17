@@ -1,27 +1,23 @@
-use libafl_bolts::rands::StdRand;
-use libafl_bolts::shmem::{ShMem, ShMemProvider, StdShMemProvider};
-use libafl_bolts::tuples::tuple_list;
-use libafl_bolts::{current_nanos, AsMutSlice};
-use libafl::corpus::{Corpus, InMemoryCorpus, OnDiskCorpus};
-use libafl::events::SimpleEventManager;
-use libafl::executors::{ForkserverExecutor, TimeoutForkserverExecutor};
-use libafl::feedbacks::{MaxMapFeedback, TimeFeedback, TimeoutFeedback};
-use libafl::inputs::BytesInput;
-use libafl::monitors::SimpleMonitor;
-use libafl::mutators::{havoc_mutations, StdScheduledMutator};
-use libafl::observers::{HitcountsMapObserver, StdMapObserver, TimeObserver};
-use libafl::schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler};
-use libafl::stages::StdMutationalStage;
-use libafl::state::{HasCorpus, StdState};
-use libafl::{feedback_and_fast, feedback_or, Error, Fuzzer, StdFuzzer};
+use core::time::Duration;
 use std::path::PathBuf;
-use std::time::Duration;
+
+use libafl::{
+    corpus::{Corpus, InMemoryCorpus, OnDiskCorpus}, events::SimpleEventManager, executors::{self, ForkserverExecutor}, feedback_and_fast, feedback_or, feedbacks::{MaxMapFeedback, TimeFeedback, TimeoutFeedback}, inputs::BytesInput, monitors::SimpleMonitor, mutators::{scheduled::havoc_mutations, tokens_mutations, StdScheduledMutator, Tokens}, observers::{HitcountsMapObserver, StdMapObserver, TimeObserver}, schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler}, stages::mutational::StdMutationalStage, state::{HasCorpus, HasMetadata, StdState}, Error, Fuzzer, StdFuzzer
+};
+use libafl_bolts::{
+    current_nanos,
+    rands::StdRand,
+    shmem::{ShMem, ShMemProvider, UnixShMemProvider},
+    tuples::tuple_list,
+    AsMutSlice, Truncate,
+};
+
+use nix::sys::signal::Signal;
 
 /// size of the shared memory mapping used as the coverage map
 const MAP_SIZE: usize = 65536;
 
 use clap::{self, Parser};
-use nix::sys::signal::Signal;
 
 // use core::time::Duration;
 // use std::path::PathBuf;
@@ -86,10 +82,10 @@ fn main() -> Result<(), Error> {
     // Component: Corpus
     //
 
-    let opt = Opt::parse();
+    // let opt = Opt::parse();
 
     // path to input corpus
-    let corpus_dirs = vec![PathBuf::from("./corpus/libos/home/")];
+    let corpus_dirs = vec![PathBuf::from("./corpus/libos")];
     // let corpus_dirs: Vec<PathBuf> = [opt.in_dir].to_vec();
 
     println!("corpus_dirs");
@@ -99,7 +95,7 @@ fn main() -> Result<(), Error> {
 
     // Corpus in which we store solutions (timeouts/hangs in this example),
     // on disk so the user can get them after stopping the fuzzer
-    let timeouts_corpus = OnDiskCorpus::new(PathBuf::from("./timeouts"))?;
+    let timeouts_corpus = OnDiskCorpus::new(PathBuf::from("./timeouts")).unwrap();
 
 
     //
@@ -119,13 +115,13 @@ fn main() -> Result<(), Error> {
     // map
 
     // The shmem provider supported by AFL++ for shared memory
-    let mut shmem_provider = StdShMemProvider::new()?;
+    let mut shmem_provider = UnixShMemProvider::new().unwrap();
 
     // The coverage map shared between observer and executor
-    let mut shmem = shmem_provider.new_shmem(MAP_SIZE)?;
+    let mut shmem = shmem_provider.new_shmem(MAP_SIZE).unwrap();
 
     // let the forkserver know the shmid
-    shmem.write_to_env("__AFL_SHM_ID")?;
+    shmem.write_to_env("__AFL_SHM_ID").unwrap();
     let shmem_buf = shmem.as_mut_slice();
 
     // Create an observation channel using the signals map
@@ -144,13 +140,20 @@ fn main() -> Result<(), Error> {
     // we need to use it alongside some other Feedback that has the ability to perform said
     // classification. These two feedbacks are combined to create a boolean formula, i.e. if the
     // input triggered a new code path, OR, false.
+    // let mut feedback = feedback_or!(
+    //     // New maximization map feedback (attempts to maximize the map contents) linked to the
+    //     // edges observer. This one will track indexes, but will not track novelties,
+    //     // i.e. new_tracking(... true, false).
+    //     MaxMapFeedback::tracking(&edges_observer, true, false),
+    //     // Time feedback, this one never returns true for is_interesting, However, it does keep
+    //     // track of testcase execution time by way of its TimeObserver
+    //     TimeFeedback::with_observer(&time_observer)
+    // );
+
     let mut feedback = feedback_or!(
-        // New maximization map feedback (attempts to maximize the map contents) linked to the
-        // edges observer. This one will track indexes, but will not track novelties,
-        // i.e. new_tracking(... true, false).
+        // New maximization map feedback linked to the edges observer and the feedback state
         MaxMapFeedback::tracking(&edges_observer, true, false),
-        // Time feedback, this one never returns true for is_interesting, However, it does keep
-        // track of testcase execution time by way of its TimeObserver
+        // Time feedback, this one does not need a feedback state
         TimeFeedback::with_observer(&time_observer)
     );
 
@@ -234,7 +237,7 @@ fn main() -> Result<(), Error> {
     println!("fuzzer");
 
     // Create the executor for the forkserver
-    let args = opt.arguments;
+    // let args = opt.arguments;
 
 
     //
@@ -245,21 +248,31 @@ fn main() -> Result<(), Error> {
     // timeout before each run. This gives us an executor that will execute a bunch of testcases
     // within the same process, eliminating a lot of the overhead associated with a fork/exec or
     // forkserver execution model.
-    let fork_server = ForkserverExecutor::builder()
-        .program(opt.executable)
-        .parse_afl_cmdline(args)
-        .coverage_map_size(MAP_SIZE)
-        // .env("CARGO_MANIFEST_DIR", "~/Project/fuzzing/zCore-fuzzing/zcore-test/zCore/rootfs")
-        // .arg("/bin/busybox")
-        .shmem_provider(&mut shmem_provider)
-        .build(tuple_list!(time_observer, edges_observer))?;
-    println!("fork_server");
+    // let fork_server = ForkserverExecutor::builder()
+    //     .program(opt.executable)
+    //     .parse_afl_cmdline(args)
+    //     .coverage_map_size(MAP_SIZE)
+    //     // .env("CARGO_MANIFEST_DIR", "~/Project/fuzzing/zCore-fuzzing/zcore-test/zCore/rootfs")
+    //     // .arg("/bin/busybox")
+    //     .shmem_provider(&mut shmem_provider)
+    //     .build(tuple_list!(time_observer, edges_observer))?;
+    // println!("fork_server");
+
+    let timeout = Duration::from_secs(5);
+    let mut executor = ForkserverExecutor::builder()
+    .program("./zCore/target/release/zcore")
+    .parse_afl_cmdline(["@@"])
+    .coverage_map_size(MAP_SIZE)
+    .shmem_provider(&mut shmem_provider)
+    .timeout(timeout)
+    .build(tuple_list!(time_observer, edges_observer))?;
+
 
     let timeout = Duration::from_secs(5);
 
 
     // wrap the fork server executor and its associated timeout limit
-    let mut executor = TimeoutForkserverExecutor::new(fork_server, timeout)?;
+    // let mut executor = TimeoutForkserverExecutor::new(fork_server, timeout)?;
 
     // In case the corpus is empty (i.e. on first run), load existing test cases from on-disk
     // corpus
